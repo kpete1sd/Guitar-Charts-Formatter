@@ -17,7 +17,8 @@ import streamlit.components.v1 as components
 
 from chartlib.ai import DEFAULT_MODEL, ai_parse
 from chartlib.chordpro import to_chordpro
-from chartlib.extract import SUPPORTED_EXT, extract, ocr_images, tesseract_available
+from chartlib.extract import (IMAGE_EXT, SUPPORTED_EXT, Extracted, combine, extract, prepare_pictures,
+                              is_scanned_pdf, run_ocr, tesseract_available, use_fallback_text)
 from chartlib.model import NOTE_FIELDS, NotesStore, song_slug, youtube_lookup, youtube_search_url
 from chartlib.parse import heuristic_parse
 from chartlib.render_html import render_html, song_meta
@@ -85,6 +86,8 @@ ss = st.session_state
 ss.setdefault("songs", {})      # sid -> song dict
 ss.setdefault("order", [])      # sids in upload order
 ss.setdefault("log", [])
+ss.setdefault("done", set())    # page files already joined into a combined song
+ss.setdefault("sources", {})    # sid -> JPEG previews of the cleaned-up photo / scan pages
 
 
 def add_song(sid: str, song: dict):
@@ -95,10 +98,25 @@ def add_song(sid: str, song: dict):
         ss.order.append(sid)
 
 
-def convert(name: str, data: bytes, use_ai: bool, api_key: str, model: str, yt_key: str):
-    msgs = []
-    ex = extract(name, data)
-    msgs += ex.warnings
+def _natural_key(name: str):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
+def is_picture_file(name: str, data: bytes) -> bool:
+    """Photos, and PDFs that are scans - the files that can be 'pages of one song'."""
+    ext = os.path.splitext(name)[1].lower()
+    if ext in IMAGE_EXT:
+        return True
+    return ext == ".pdf" and is_scanned_pdf(data)
+
+
+def convert_extracted(ex: Extracted, use_ai: bool, api_key: str, model: str, yt_key: str):
+    """Extracted file(s) -> (song dict or None, messages, page previews)."""
+    name = ex.filename
+    msgs = list(ex.warnings)
+    previews = []
+    if ex.has_pictures:
+        previews = prepare_pictures(ex)          # upright, straight, evenly lit - done once
     song, engine = None, "built-in"
     if use_ai and api_key and (ex.text.strip() or ex.images or ex.pdf_bytes):
         try:
@@ -108,22 +126,38 @@ def convert(name: str, data: bytes, use_ai: bool, api_key: str, model: str, yt_k
             msgs.append(f"Claude couldn't convert this one ({type(e).__name__}: {str(e)[:160]}); "
                         "used the built-in converter instead.")
     if song is None:
-        if ex.needs_ocr or (not ex.text.strip() and ex.images):
+        if ex.needs_ocr:
+            n = len(ex.images)
+            pages = f"{n} photo/scan page{'s' if n != 1 else ''}"
             if tesseract_available():
-                ex.text = ocr_images(ex.images)
-                msgs.append("Photo/scan read with OCR - check chords carefully (Claude AI mode is more accurate).")
+                conf = run_ocr(ex)
+                tip = "" if conf >= 80 else " Claude AI mode reads photos much more accurately."
+                level = "good" if conf >= 80 else "fair - check the chords" if conf >= 60 else \
+                        "poor - check everything against the original"
+                msgs.append(f"Read {pages} with OCR (quality {level}, {conf:.0f}%).{tip}")
+            elif use_fallback_text(ex):
+                msgs.append(f"Used the text the scanner stored in the PDF for {pages}. Install Tesseract "
+                            "or use Claude AI mode for a better read.")
             else:
                 msgs.append("This is a photo or scan. Turn on Claude AI mode (or install Tesseract OCR) to read it.")
         if not ex.text.strip():
-            return None, msgs
+            return None, msgs, previews
         song = heuristic_parse(ex.text, name)
+    elif ex.has_pictures:
+        msgs.append(f"Read {len(ex.images)} photo/scan page{'s' if len(ex.images) != 1 else ''} with Claude.")
+    if ex.notes:
+        msgs.append("Picture clean-up: " + ", ".join(ex.notes) + ".")
     song["source"] = name
-    song["engine"] = engine
+    song["engine"] = engine + (" + photo/scan" if ex.has_pictures else "")
     if not song.get("youtube_url") and yt_key:
         found = youtube_lookup(song.get("title", ""), song.get("artist", ""), yt_key)
         if found:
             song["youtube_url"] = found
-    return song, msgs
+    return song, msgs, previews
+
+
+def convert(name: str, data: bytes, use_ai: bool, api_key: str, model: str, yt_key: str):
+    return convert_extracted(extract(name, data), use_ai, api_key, model, yt_key)
 
 
 # ------------------------------------------------------------------ sidebar
@@ -149,8 +183,9 @@ with st.sidebar:
                                type="password",
                                help="With a key, each chart links straight to the top video. "
                                     "Without one, the link opens a YouTube search for the song.")
-        st.caption("OCR for photos (built-in mode): " +
-                   ("✅ Tesseract found" if tesseract_available() else "❌ Tesseract not installed"))
+        st.caption("OCR for photos & scans (built-in mode): " +
+                   ("✅ Tesseract found" if tesseract_available() else
+                    "❌ Tesseract not installed - photos need Claude AI mode"))
 
     st.subheader("📄 Output")
     stage = st.toggle("🎤 Stage mode", value=True,
@@ -181,7 +216,7 @@ with st.sidebar:
 
     st.divider()
     if ss.order and st.button("🗑️ Clear all songs"):
-        ss.songs, ss.order = {}, []
+        ss.songs, ss.order, ss.sources, ss.done = {}, [], {}, set()
         st.rerun()
 
 
@@ -196,20 +231,50 @@ with tab_up:
     for f in files or []:
         data = f.getvalue()
         sid = hashlib.sha1(f.name.encode() + data).hexdigest()[:12]
-        if sid not in ss.songs:
+        if sid not in ss.songs and sid not in ss.done:
             new.append((sid, f.name, data))
-    label = f"Convert {len(new)} new file{'s' if len(new) != 1 else ''}" if new else "Convert"
+    pics = [x for x in new if is_picture_file(x[1], x[2])]
+    as_one = False
+    if len(pics) >= 2:
+        as_one = st.checkbox(
+            f"📸 The {len(pics)} photos/scans are pages of ONE song (join them in file-name order)",
+            value=False, help="Tick this when you photographed a two- or three-page chart. "
+                              "Leave it off when each photo is a different song.")
+    if as_one:
+        n_jobs = len(new) - len(pics) + 1
+        label = f"Convert {n_jobs} song{'s' if n_jobs != 1 else ''}"
+    else:
+        label = f"Convert {len(new)} new file{'s' if len(new) != 1 else ''}" if new else "Convert"
+    st.caption("📷 On an iPad or phone, the upload button also offers **Take Photo**. Tips for photos: "
+               "fill the frame with the page, avoid strong shadows, and hold the camera square-on. "
+               "Tilt, sideways shots and uneven light are fixed automatically.")
     if st.button(label, type="primary", disabled=not new or (use_ai and not api_key)):
+        jobs = []                       # (sid, display name, Extracted factory)
+        if as_one:
+            pics_sorted = sorted(pics, key=lambda x: _natural_key(x[1]))
+            sid = hashlib.sha1(b"".join(x[0].encode() for x in pics_sorted)).hexdigest()[:12]
+            nm = " + ".join(x[1] for x in pics_sorted)
+            jobs.append((sid, nm, lambda ps=pics_sorted, nm=nm:
+                         combine([extract(n, d) for _, n, d in ps], nm)))
+            rest = [x for x in new if x not in pics]
+        else:
+            rest = new
+        for sid, name, data in rest:
+            jobs.append((sid, name, lambda n=name, d=data: extract(n, d)))
         prog = st.progress(0.0, text="Converting…")
-        for i, (sid, name, data) in enumerate(new):
-            prog.progress(i / len(new), text=f"Converting {name} ({i + 1}/{len(new)})…")
-            song, msgs = convert(name, data, use_ai, api_key, model, yt_key)
+        for i, (sid, name, make) in enumerate(jobs):
+            prog.progress(i / len(jobs), text=f"Converting {name} ({i + 1}/{len(jobs)})…")
+            song, msgs, previews = convert_extracted(make(), use_ai, api_key, model, yt_key)
             for m in msgs:
                 ss.log.append((name, m))
             if song:
                 add_song(sid, song)
+                if previews:
+                    ss.sources[sid] = previews
             else:
                 ss.log.append((name, "Nothing readable found in this file."))
+        if as_one:                      # remember the page files so they aren't offered again
+            ss.done.update(x[0] for x in pics)
         prog.progress(1.0, text="Done")
         st.rerun()
 
@@ -219,8 +284,7 @@ with tab_paste:
         p_text = st.text_area("Paste chart text (Ultimate Guitar, email, ChordPro…)", height=260)
         if st.form_submit_button("Convert pasted chart", type="primary") and p_text.strip():
             sid = hashlib.sha1(p_text.encode()).hexdigest()[:12]
-            from chartlib.extract import Extracted
-            ex = Extracted(filename=(p_title or "pasted") + ".txt", kind="text", text=p_text)
+            ex = Extracted(filename=(p_title or "pasted") + ".txt", kind="text", parts=[p_text])
             song = None
             if use_ai and api_key:
                 try:
@@ -301,6 +365,12 @@ for sid in list(ss.order):
             if flags:
                 st.caption("⚠️ Please check: " + "; ".join(flags) + ".")
             st.caption(f"Source: {song.get('source', '')} · converted with {song.get('engine', '')}")
+            if ss.sources.get(sid):
+                with st.expander(f"🖼️ Compare with the original ({len(ss.sources[sid])} page"
+                                 f"{'s' if len(ss.sources[sid]) != 1 else ''}, cleaned up)"):
+                    cols = st.columns(min(len(ss.sources[sid]), 2))
+                    for i, jpg in enumerate(ss.sources[sid]):
+                        cols[i % len(cols)].image(jpg, caption=f"Page {i + 1}", use_container_width=True)
             with st.form(f"edit_{sid}"):
                 c1, c2 = st.columns(2)
                 title = c1.text_input("Title", song["title"])
@@ -364,6 +434,7 @@ for sid in list(ss.order):
             if c4.button("Remove", key=f"rm_{sid}"):
                 ss.order.remove(sid)
                 ss.songs.pop(sid, None)
+                ss.sources.pop(sid, None)
                 st.rerun()
 
 # ------------------------------------------------------------------ batch / set list

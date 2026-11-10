@@ -33,6 +33,26 @@ Push this folder to GitHub, create the app with `app.py` as the entry point, and
 The cloud server forgets its files when it restarts, so use **Back up notes (.json)** in the sidebar now and then
 and **Restore / merge notes** to bring them back.
 
+## Photos and scans
+Charts can come in as phone photos (JPG, PNG, HEIC), screenshots, scanned PDFs, multi-page TIFFs from a
+document scanner, PDFs that mix typed and scanned pages, or a Word file with the chart pasted in as a picture.
+
+- **Automatic clean-up** before reading: turns sideways or upside-down pages upright, straightens tilt,
+  evens out shadows and lamp light, removes the desk or music stand around the page, and flips dark-mode
+  screenshots (light text on black).
+- **Chords stay in place.** OCR keeps each word's position, so chords land above the right syllable, and
+  common misreads (`8b`→`Bb`, `Cc`→`C`, `Am/`→`Am7`) are fixed on chord lines only, never in lyrics.
+- **Several photos of one song:** select them together and tick *"The photos/scans are pages of ONE song"*.
+  They're joined in file-name order (`page1`, `page2`, … or the camera's own numbering).
+- **Mixed PDFs:** typed pages are read as text, scanned pages are read from the picture, and everything
+  stays in page order.
+- **Long phone screenshots** are cut into overlapping strips for Claude so the text isn't shrunk.
+- **Check it:** the *Edit chart* tab has *Compare with the original* to show the cleaned-up page next to
+  the converted text, and the message after converting gives the OCR quality.
+
+Claude AI mode gives the best results on photos and also reads handwritten chords and band markings.
+Built-in mode needs Tesseract (see above) and works best on printed charts.
+
 ## Stage mode (sidebar switch, on by default)
 Built for reading at a glance from a music stand in a dim, glare-prone room:
 - **Big, legible type** in Atkinson Hyperlegible (bundled, so it works without internet). Sharps and flats use real ♯/♭ symbols.
@@ -74,6 +94,7 @@ Transposing (in the Edit tab) changes every chord and the key, and keeps the spe
 
 ## Files
 - `app.py`: the Streamlit app
+- `chartlib/vision.py`: photo and scan clean-up, and position-keeping OCR
 - `chartlib/`: extraction, parsing (built-in and Claude), key detection and transposition, plus the HTML, PDF and ChordPro renderers
 - `chartlib/stage.py` + `chartlib/fonts/`: Stage mode (section colours, road map, Atkinson Hyperlegible under the SIL Open Font License, and a tiny DejaVu-based ♯/♭ symbol font)
 - `data/band_notes.json`: your saved band notes, created on first save
